@@ -7,10 +7,17 @@ SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
     "dev-only-haulway-key-change-before-any-public-deploy",
 )
-DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes"}
+DEBUG = os.environ.get(
+    "DJANGO_DEBUG",
+    "false" if os.environ.get("RENDER") else "true",
+).lower() in {"1", "true", "yes"}
+
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+    for host in os.environ.get(
+        "DJANGO_ALLOWED_HOSTS",
+        "localhost,127.0.0.1" if not os.environ.get("RENDER") else "",
+    ).split(",")
     if host.strip()
 ]
 
@@ -23,6 +30,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.middleware.common.CommonMiddleware",
 ]
 
@@ -51,7 +60,8 @@ TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Anonymous JSON API. Empty auth classes avoid Django's session CSRF check.
