@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from planner.services.errors import PlanError
+from planner.services.geo import cumulative_miles, decode_polyline, distinct_corridor
+from planner.services.models import RawRoute
+from planner.services.sampling import via_candidates
+
+logger = logging.getLogger("planner")
+
+USER_AGENT = "Haulway/1.0 (weather-aware truck routing demo)"
+OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+_session: requests.Session | None = None
+_geocode_cache: dict[str, tuple[datetime, list[dict]]] = {}
+
+
+def _http() -> requests.Session:
+    global _session
+    if _session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            backoff_factor=0.4,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=8)
+        session.mount("https://", adapter)
+        session.headers["User-Agent"] = USER_AGENT
+        _session = session
+    return _session
+
+
+def round_key(lat: float, lon: float) -> tuple[float, float]:
+    return (round(float(lat), 2), round(float(lon), 2))
+
+
+def geocode_search(query: str) -> list[dict]:
+    cleaned = " ".join(query.split())
+    if len(cleaned) < 2:
+        raise PlanError("Enter at least two characters to search.")
+    if len(cleaned) > 120:
+        raise PlanError("That place name is too long.")
+    cached = _geocode_cache.get(cleaned.lower())
+    now = datetime.now(timezone.utc)
+    if cached and now - cached[0] < timedelta(minutes=10):
+        return cached[1]
+    try:
+        # Coordinates come from this search. The user types a place name;
+        # Nominatim returns the matching label, latitude, and longitude.
+        response = _http().get(
+            NOMINATIM_URL,
+            params={
+                "q": cleaned,
+                "format": "jsonv2",
+                "limit": 5,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        logger.warning("geocode failed: %s", exc)
+        raise PlanError("Place search is unavailable. Try again in a moment.", 502) from exc
+    results = []
+    for item in payload if isinstance(payload, list) else []:
+        try:
+            results.append(
+                {
+                    "label": str(item.get("display_name") or cleaned)[:180],
+                    "lat": float(item["lat"]),
+                    "lon": float(item["lon"]),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    _geocode_cache[cleaned.lower()] = (now, results)
+    if len(_geocode_cache) > 100:
+        oldest = sorted(_geocode_cache.items(), key=lambda item: item[1][0])[:20]
+        for key, _ in oldest:
+            _geocode_cache.pop(key, None)
+    return results
+
+
+def _osrm(coordinates: list[tuple[float, float]], alternatives: int | None) -> list[RawRoute]:
+    path = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in coordinates)
+    params = {
+        "overview": "full",
+        "geometries": "polyline",
+        "steps": "false",
+    }
+    if alternatives:
+        params["alternatives"] = str(alternatives)
+    else:
+        params["continue_straight"] = "false"
+    try:
+        response = _http().get(f"{OSRM_URL}/{path}", params=params, timeout=40)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        logger.warning("osrm failed: %s", exc)
+        raise PlanError("Routing service is unavailable. Try again in a moment.", 502) from exc
+    code = payload.get("code")
+    if code == "NoRoute":
+        raise PlanError("No drivable route was found between those points.", 404)
+    if code != "Ok":
+        logger.warning("osrm code %s: %s", code, payload.get("message"))
+        raise PlanError("Routing service could not build a route. Try again.", 502)
+    routes: list[RawRoute] = []
+    for route in payload.get("routes") or []:
+        geometry = route.get("geometry")
+        if not isinstance(geometry, str):
+            continue
+        coords = decode_polyline(geometry)
+        if len(coords) < 2:
+            continue
+        try:
+            distance = float(route["distance"]) / 1609.344
+            duration = float(route["duration"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if distance <= 0 or duration <= 0:
+            continue
+        routes.append(
+            RawRoute(coords=coords, distance_miles=distance, duration_seconds=duration)
+        )
+    return routes
+
+
+def driving_routes(
+    origin: tuple[float, float], destination: tuple[float, float]
+) -> tuple[list[RawRoute], list[str]]:
+    """Up to three distinct driving corridors, synthesizing a detour when needed."""
+    notes: list[str] = []
+    try:
+        found = _osrm([origin, destination], alternatives=3)
+    except PlanError:
+        raise
+    kept: list[RawRoute] = []
+    for route in found:
+        cumulative = cumulative_miles(route.coords)
+        if not kept or distinct_corridor(
+            route.coords, cumulative, [item.coords for item in kept]
+        ):
+            kept.append(route)
+        if len(kept) == 3:
+            return kept, notes
+    if not kept:
+        raise PlanError("No drivable route was found between those points.", 404)
+
+    base_cumulative = cumulative_miles(kept[0].coords)
+    for via in via_candidates(kept[0].coords, base_cumulative):
+        if len(kept) >= 3:
+            break
+        try:
+            detours = _osrm([origin, via, destination], alternatives=None)
+        except PlanError as exc:
+            logger.info("via route skipped: %s", exc.message)
+            continue
+        for route in detours:
+            cumulative = cumulative_miles(route.coords)
+            if distinct_corridor(
+                route.coords, cumulative, [item.coords for item in kept]
+            ):
+                kept.append(route)
+                break
+    if len(kept) < 3:
+        notes.append(
+            "Fewer than three distinct driving corridors were available for this trip."
+        )
+    return kept[:3], notes
+
+
+def _parse_series(item: dict) -> dict[datetime, tuple[float | None, float | None, float | None]]:
+    hourly = item.get("hourly") or {}
+    times = hourly.get("time") or []
+    wind = hourly.get("wind_speed_10m") or []
+    rain = hourly.get("rain") or []
+    showers = hourly.get("showers") or []
+    snow = hourly.get("snowfall") or []
+    series: dict[datetime, tuple[float | None, float | None, float | None]] = {}
+    for index, stamp in enumerate(times):
+        try:
+            hour = datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        wind_value = _optional_float(wind, index)
+        rain_value = _sum_optional(_optional_float(rain, index), _optional_float(showers, index))
+        snow_value = _optional_float(snow, index)
+        series[hour] = (wind_value, rain_value, snow_value)
+    return series
+
+
+def _optional_float(values, index: int) -> float | None:
+    if index >= len(values):
+        return None
+    value = values[index]
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_optional(left: float | None, right: float | None) -> float | None:
+    if left is None and right is None:
+        return None
+    return (left or 0.0) + (right or 0.0)
+
+
+def _fetch_batch(
+    keys: list[tuple[float, float]], start_date: str, end_date: str
+) -> dict[tuple[float, float], dict]:
+    params = {
+        "latitude": ",".join(f"{lat:.2f}" for lat, _ in keys),
+        "longitude": ",".join(f"{lon:.2f}" for _, lon in keys),
+        "hourly": "wind_speed_10m,rain,showers,snowfall",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",
+        "snowfall_unit": "inch",
+        "timezone": "UTC",
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    try:
+        response = _http().get(METEO_URL, params=params, timeout=40)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        logger.warning("open-meteo failed: %s", exc)
+        raise PlanError("Weather service is unavailable. Try again in a moment.", 502) from exc
+    if isinstance(payload, dict) and payload.get("error"):
+        logger.warning("open-meteo error: %s", payload.get("reason"))
+        raise PlanError("Weather service rejected the forecast request.", 502)
+    items = payload if isinstance(payload, list) else [payload]
+    if len(items) != len(keys):
+        logger.warning("open-meteo returned %s locations for %s", len(items), len(keys))
+        raise PlanError("Weather service returned an unexpected forecast.", 502)
+    return {key: _parse_series(item) for key, item in zip(keys, items)}
+
+
+def fetch_hourly(
+    points: list[tuple[float, float]], departure: datetime
+) -> dict[tuple[float, float], dict[datetime, tuple]]:
+    unique = list(dict.fromkeys(round_key(lat, lon) for lat, lon in points))
+    if not unique:
+        return {}
+    start = departure.astimezone(timezone.utc)
+    end = start + timedelta(hours=48)
+    start_date = start.date().isoformat()
+    end_date = end.date().isoformat()
+    batches = [unique[index : index + 40] for index in range(0, len(unique), 40)]
+    merged: dict[tuple[float, float], dict] = {}
+    workers = min(4, len(batches))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_fetch_batch, batch, start_date, end_date) for batch in batches
+        ]
+        for future in futures:
+            merged.update(future.result())
+    return merged
