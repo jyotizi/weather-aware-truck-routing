@@ -404,7 +404,9 @@ def _fetch_batch(
     if not missing:
         return merged
 
-    batch_size = 10
+    # Open-Meteo accepts multiple locations per request. Larger batches
+    # reduce request frequency and help avoid free-tier rate limits.
+    batch_size = 50
 
     for offset in range(0, len(missing), batch_size):
         batch = missing[offset:offset + batch_size]
@@ -507,7 +509,9 @@ def _fetch_batch(
                         end_date,
                     ),
                     series,
-                    timeout=900,
+                    # Forecasts for a given coordinate/date are reusable;
+                    # retain them longer to reduce repeated provider calls.
+                    timeout=21600,
                 )
 
             merged[point] = series

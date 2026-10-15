@@ -22,6 +22,17 @@ from planner.services.sampling import (
 )
 
 
+def _limit_heatmap_points(points: list[tuple[float, float]], limit: int = 36) -> list[tuple[float, float]]:
+    """Evenly thin heatmap-only points while preserving route checkpoints."""
+    if len(points) <= limit:
+        return points
+    if limit <= 1:
+        return points[:1]
+    last = len(points) - 1
+    indexes = sorted({round(i * last / (limit - 1)) for i in range(limit)})
+    return [points[index] for index in indexes]
+
+
 def plan_trip(
     origin: dict,
     destination: dict,
@@ -47,6 +58,9 @@ def plan_trip(
         prepared.append((raw, checkpoints, cumulative, scale))
 
     grid = corridor_points([(route.coords, cumulative) for route, _, cumulative, _ in prepared])
+    # The heatmap is a visual overview, so thin only its points when needed.
+    # All route checkpoints remain available for risk scoring.
+    grid = _limit_heatmap_points(grid)
     weather_points = [(cp.lat, cp.lon) for _, checkpoints, _, _ in prepared for cp in checkpoints]
     weather_points.extend(grid)
     forecasts = fetch_hourly(weather_points, departure)
