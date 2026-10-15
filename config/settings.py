@@ -93,3 +93,11 @@ LOGGING = {
         "planner": {"handlers": ["console"], "level": "INFO", "propagate": False}
     },
 }
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "weather-aware-routing-cache",
+        "TIMEOUT": 900,
+    }
+}
