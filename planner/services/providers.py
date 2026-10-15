@@ -1,9 +1,13 @@
+import hashlib
+import json
+
+from django.core.cache import cache
 from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-
+from planner.weather import fetch_weather
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -29,11 +33,12 @@ def _http() -> requests.Session:
     if _session is None:
         session = requests.Session()
         retry = Retry(
-            total=2,
-            backoff_factor=0.4,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET"]),
-        )
+    total=2,
+    backoff_factor=0.5,
+    status_forcelist=(500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    respect_retry_after_header=True,
+)
         adapter = HTTPAdapter(max_retries=retry, pool_maxsize=8)
         session.mount("https://", adapter)
         session.headers["User-Agent"] = USER_AGENT
@@ -219,54 +224,148 @@ def _sum_optional(left: float | None, right: float | None) -> float | None:
     return (left or 0.0) + (right or 0.0)
 
 
+
 def _fetch_batch(
     keys: list[tuple[float, float]], start_date: str, end_date: str
 ) -> dict[tuple[float, float], dict]:
-    params = {
-        "latitude": ",".join(f"{lat:.2f}" for lat, _ in keys),
-        "longitude": ",".join(f"{lon:.2f}" for _, lon in keys),
-        "hourly": "wind_speed_10m,rain,showers,snowfall",
-        "wind_speed_unit": "mph",
-        "precipitation_unit": "inch",
-        "snowfall_unit": "inch",
-        "timezone": "UTC",
-        "start_date": start_date,
-        "end_date": end_date,
-    }
-    try:
-        response = _http().get(METEO_URL, params=params, timeout=40)
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        logger.warning("open-meteo failed: %s", exc)
-        raise PlanError("Weather service is unavailable. Try again in a moment.", 502) from exc
-    if isinstance(payload, dict) and payload.get("error"):
-        logger.warning("open-meteo error: %s", payload.get("reason"))
-        raise PlanError("Weather service rejected the forecast request.", 502)
-    items = payload if isinstance(payload, list) else [payload]
-    if len(items) != len(keys):
-        logger.warning("open-meteo returned %s locations for %s", len(items), len(keys))
-        raise PlanError("Weather service returned an unexpected forecast.", 502)
-    return {key: _parse_series(item) for key, item in zip(keys, items)}
+    # Cache each coordinate separately so overlapping routes
+    # can reuse previously fetched forecasts.
+    prefix = f"open_meteo:v1:{start_date}:{end_date}:"
+    merged: dict[tuple[float, float], dict] = {}
+    missing: list[tuple[float, float]] = []
+
+    for lat, lon in keys:
+        key = (lat, lon)
+        cache_key = prefix + hashlib.sha256(
+            f"{lat:.2f},{lon:.2f}".encode("utf-8")
+        ).hexdigest()
+
+        cached = cache.get(cache_key)
+        if cached is None:
+            missing.append(key)
+        else:
+            merged[key] = cached
+
+    # All requested forecasts were already cached.
+    if not missing:
+        return merged
+
+    # Keep batches smaller to reduce oversized requests.
+    batch_size = 10
+
+    for offset in range(0, len(missing), batch_size):
+        batch = missing[offset : offset + batch_size]
+
+        params = {
+            "latitude": ",".join(f"{lat:.2f}" for lat, _ in batch),
+            "longitude": ",".join(f"{lon:.2f}" for _, lon in batch),
+            "hourly": "wind_speed_10m,rain,showers,snowfall",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch",
+            "snowfall_unit": "inch",
+            "timezone": "UTC",
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+
+        try:
+            response = _http().get(
+                METEO_URL,
+                params=params,
+                timeout=40,
+            )
+
+            if response.status_code == 429:
+                logger.warning("Open-Meteo rate limit reached")
+                raise PlanError(
+                    "Weather service is busy. Please try again later.",
+                    503,
+                )
+
+            response.raise_for_status()
+            payload = response.json()
+
+        except PlanError:
+            raise
+        except requests.RequestException as exc:
+            logger.warning("Open-Meteo failed: %s", exc)
+            raise PlanError(
+                "Weather service is temporarily unavailable. Try again later.",
+                503,
+            ) from exc
+        except ValueError as exc:
+            logger.warning("Open-Meteo returned invalid JSON: %s", exc)
+            raise PlanError(
+                "Weather service returned an invalid response.",
+                502,
+            ) from exc
+
+        if isinstance(payload, dict) and payload.get("error"):
+            logger.warning(
+                "Open-Meteo error: %s", payload.get("reason")
+            )
+            raise PlanError(
+                "Weather service rejected the forecast request.",
+                502,
+            )
+
+        items = payload if isinstance(payload, list) else [payload]
+
+        if len(items) != len(batch):
+            logger.warning(
+                "Open-Meteo returned %s locations for %s",
+                len(items),
+                len(batch),
+            )
+            raise PlanError(
+                "Weather service returned an unexpected forecast.",
+                502,
+            )
+
+        for point, item in zip(batch, items):
+            series = _parse_series(item)
+
+            # Cache only usable forecasts; don't cache empty results.
+            if series:
+                cache_key = prefix + hashlib.sha256(
+                    f"{point[0]:.2f},{point[1]:.2f}".encode("utf-8")
+                ).hexdigest()
+
+                cache.set(cache_key, series, timeout=900)
+
+            merged[point] = series
+
+    return merged
+
+   
+
 
 
 def fetch_hourly(
     points: list[tuple[float, float]], departure: datetime
 ) -> dict[tuple[float, float], dict[datetime, tuple]]:
     unique = list(dict.fromkeys(round_key(lat, lon) for lat, lon in points))
+
     if not unique:
         return {}
+
     start = departure.astimezone(timezone.utc)
     end = start + timedelta(hours=48)
+
     start_date = start.date().isoformat()
     end_date = end.date().isoformat()
-    batches = [unique[index : index + 40] for index in range(0, len(unique), 40)]
-    merged: dict[tuple[float, float], dict] = {}
-    workers = min(4, len(batches))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_fetch_batch, batch, start_date, end_date) for batch in batches
-        ]
-        for future in futures:
-            merged.update(future.result())
+
+    # Process smaller batches sequentially to reduce API request bursts.
+    batches = [
+        unique[index : index + 10]
+        for index in range(0, len(unique), 10)
+    ]
+
+    merged: dict[tuple[float, float], dict[datetime, tuple]] = {}
+
+    for batch in batches:
+        result = _fetch_batch(batch, start_date, end_date)
+        merged.update(result)
+
     return merged
+
