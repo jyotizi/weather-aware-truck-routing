@@ -16,10 +16,13 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in os.environ.get(
         "DJANGO_ALLOWED_HOSTS",
-        "localhost,127.0.0.1" if not os.environ.get("RENDER") else "",
+        "localhost,127.0.0.1,weather-aware-truck-routing-api-b8rl.onrender.com"
+        if os.environ.get("RENDER")
+        else "localhost,127.0.0.1",
     ).split(",")
     if host.strip()
 ]
+
 
 INSTALLED_APPS = [
     "django.contrib.staticfiles",
